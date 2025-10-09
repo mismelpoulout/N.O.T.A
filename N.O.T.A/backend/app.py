@@ -6,19 +6,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import dotenv_values
 
-# ✅ Importa con el paquete 'backend'
 from backend.core.pipeline import NOTAPipeline
-from backend.core.search_client import SearchClient  # <- cliente unificado (Google/Bing)
+from backend.core.search_client import SearchClient
 
-# Carga .env + entorno
 cfg = {**dotenv_values("backend/.env"), **os.environ}
 
 DATA_DIR = cfg.get("DATA_DIR", "./backend/data")
 ALLOWED = cfg.get("ALLOWED_ORIGINS", "*")
+ENGINE = (cfg.get("SEARCH_ENGINE") or "google").lower()
 
 app = FastAPI(title="N.O.T.A", version="0.3")
 
-# CORS
 allow_origins = ["*"] if ALLOWED == "*" else [o.strip() for o in ALLOWED.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -28,10 +26,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔎 Motor de búsqueda (elige por SEARCH_ENGINE=google | bing)
-search_client = SearchClient()
+# motor de búsqueda desde .env
+search_client = SearchClient.from_env(cfg)
+print(f"🔍 SEARCH_ENGINE={ENGINE.upper()} | client={'OK' if search_client.impl else 'None'}")
 
-# 🧠 Pipeline principal
 pipe = NOTAPipeline(db_dir=DATA_DIR, search_client=search_client)
 
 class ChatIn(BaseModel):
@@ -40,6 +38,7 @@ class ChatIn(BaseModel):
 @app.on_event("startup")
 async def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
+    print(f"📂 DATA_DIR: {os.path.abspath(DATA_DIR)}")
 
 @app.get("/health")
 def health():
@@ -50,8 +49,16 @@ async def chat(body: ChatIn):
     notes, answer = await pipe.run(body.q)
     return {"answer": answer, "notes": notes, "citations": notes.get("citations", [])}
 
-# 👇 Endpoint de prueba para el motor de búsqueda (sin pasar por todas las capas)
-@app.get("/search/test")
-async def search_test(q: str):
-    hits = await search_client.search(q, count=5)
-    return {"ok": True, "count": len(hits), "items": hits[:5]}
+# Debug opcional
+@app.get("/debug/env")
+def debug_env():
+    masked = (cfg.get("GOOGLE_API_KEY") or cfg.get("GOOGLE_KEY") or "")
+    if masked:
+        masked = masked[:6] + "..." + masked[-4:]
+    return {
+        "SEARCH_ENGINE": ENGINE,
+        "GOOGLE_API_KEY": "set" if masked else "missing",
+        "GOOGLE_API_KEY_preview": masked,
+        "GOOGLE_CX": cfg.get("GOOGLE_CX"),
+        "BING_KEY": "set" if cfg.get("BING_KEY") else "missing",
+    }
