@@ -1,36 +1,77 @@
-from readability import Document
-from bs4 import BeautifulSoup
-import trafilatura
+# backend/core/cleaners.py
+from __future__ import annotations
 import httpx
+from bs4 import BeautifulSoup
+from typing import Optional
 
-async def fetch_and_clean(url: str, timeout_s: int = 12) -> str:
-    """Descarga y limpia HTML → texto. Intenta trafilatura y luego readability."""
+# Trafilatura opcional
+try:
+    import trafilatura
+except Exception:
+    trafilatura = None
+
+# Readability opcional
+try:
+    from readability import Document  # requiere lxml + lxml_html_clean
+except Exception:
+    Document = None
+
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+
+async def fetch_and_clean(url: str, timeout: int = 15) -> Optional[str]:
+    """
+    Descarga y limpia HTML de forma resiliente.
+    Orden: Trafilatura -> Readability -> BeautifulSoup (fallback).
+    Devuelve texto plano o None si todo falla.
+    """
     try:
-        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers={"User-Agent": UA},
+        ) as client:
+            r = await client.get(url)
             r.raise_for_status()
             html = r.text
     except Exception:
-        return ""
+        return None
 
-    # Trafilatura primero
+    # 1) Trafilatura (si está)
+    if trafilatura is not None:
+        try:
+            txt = trafilatura.extract(html, include_comments=False)  # type: ignore
+            if txt and len(txt.strip()) > 200:
+                return txt.strip()
+        except Exception:
+            pass
+
+    # 2) Readability (si está)
+    if Document is not None:
+        try:
+            doc = Document(html)  # type: ignore
+            summary_html = doc.summary()
+            soup = BeautifulSoup(summary_html, "html.parser")
+            txt = soup.get_text("\n", strip=True)
+            if txt and len(txt.strip()) > 200:
+                return txt.strip()
+        except Exception:
+            pass
+
+    # 3) Fallback: BeautifulSoup directo
     try:
-        txt = trafilatura.extract(html, include_comments=False, include_tables=False, favor_recall=True)
-        if txt and len(txt.strip()) > 200:
+        soup = BeautifulSoup(html, "html.parser")
+        for bad in soup(["script", "style", "noscript"]):
+            bad.extract()
+        txt = soup.get_text("\n", strip=True)
+        if txt and len(txt.strip()) > 80:
             return txt.strip()
     except Exception:
         pass
 
-    # Readability + BeautifulSoup como fallback
-    try:
-        doc = Document(html)
-        cleaned_html = doc.summary()
-        soup = BeautifulSoup(cleaned_html, "lxml")
-        text = soup.get_text("\n")
-        text = "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
-        if len(text) > 200:
-            return text
-    except Exception:
-        pass
-
-    return ""
+    return None
