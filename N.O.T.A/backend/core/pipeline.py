@@ -1,316 +1,296 @@
 # backend/core/pipeline.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import re
-import math
+import re, random
 from collections import Counter, defaultdict
-from datetime import datetime
-from typing import List, Dict, Tuple
-
-import tldextract
+from typing import Tuple, Dict, List, Optional
 
 from backend.core.db.local_search import LocalMedicalSearcher
-from backend.core.cleaners import fetch_and_clean
-# Si tienes un cliente unificado, lo inyectas desde app.py:
-# from backend.core.search_client import SearchClient
+from backend.core.db.ios_fts_search import IOSFTSSearcher
+from backend.core.cached_fetch import cached_fetch_and_clean
+from backend.core.dose_parser import extract_dose_table, doses_to_markdown
+from backend.core.evidence import evidence_score
+from backend.core.specialties import detect_specialties, score_specialty
 
-
-# -------------------- Config y patrones --------------------
-
-SPANISH_SECTIONS = {
-    "definicion": (
-        "definición", "definicion", "es una", "se define", "consiste en",
-        "enfermedad", "entidad clínica", "cuadro clínico", "etiología", "causa"
-    ),
-    "sintomas": (
-        "síntoma", "sintomas", "signos", "manifestaciones", "cuadro", "clínico",
-        "fiebre", "tos", "odinofagia", "cefalea", "mialgia", "disnea", "rinorrea"
-    ),
-    "diagnostico": (
-        "diagnóstico", "diagnosticar", "criterio", "criterios", "diferencial",
-        "prueba", "test", "examen", "laboratorio", "radiografía", "pcr", "antígeno"
-    ),
-    "tratamiento": (
-        "tratamiento", "manejo", "terapia", "antibiótico", "antiviral", "analgésico",
-        "antiinflamatorio", "hidratación", "reposo", "antitérmico"
-    ),
-    "conducta": (
-        "conducta", "plan", "seguimiento", "derivación", "derivar", "hospitalización",
-        "criterios de ingreso", "criterios de hospitalización", "control a las 48 horas",
-        "revaluación", "alta", "manejo ambulatorio", "educación", "alerta", "banderas rojas"
-    ),
+# ---------- Secciones
+SPANISH_SECTIONS: dict[str, tuple[str, ...]] = {
+    "definicion": ("definición","definicion","es una","se define","consiste","etiología","epidemiología","prevalencia","incidencia","clasificación","factores de riesgo"),
+    "sintomas": ("síntoma","sintomas","signos","manifestaciones","cuadro clínico","dolor","tos","fiebre","disnea","cefalea","astenia","náuseas","vómitos"),
+    "diagnostico": ("diagnóstico","criterios","diferencial","laboratorio","imagen","ecografía","radiografía","tac","rm","pcr","antígeno","biopsia","prueba"),
+    "tratamiento": ("tratamiento","manejo","terapia","farmacológico","medicamentos","rehabilitación","no farmacológico","antibiótico","analgésico","antiinflamatorio","insulina","metformina","antihipertensivo","quirúrgico","cirugía","operación","resección","injerto"),
+    "conducta": ("conducta","seguimiento","derivación","control","educación","alta","criterios de ingreso","banderas rojas","reevaluación","hospitalización"),
 }
 
-DOSIS_RX = re.compile(
-    r"(?P<drug>[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\- ]{2,})"
-    r".{0,30}?(?P<dose>\d{1,4}\s?(?:mg|mcg|g|ml))"
-    r"(?:\s*(?:cada|c\/)\s*(?P<int>\d{1,2})\s*(?:h|horas))?",
-    flags=re.IGNORECASE,
-)
-
-WHITELIST_WEIGHT = {
-    # +3 confiables, +2 buenos, +1 neutros
-    "who.int": 3, "cdc.gov": 3, "nejm.org": 3, "thelancet.com": 3,
-    "mayoclinic.org": 2, "nih.gov": 3, "medlineplus.gov": 3,
-    "merckmanuals.com": 2, "msdmanuals.com": 2,
-    "gov": 2, "edu": 2,  # TLD
-}
-
-# -------------------- Helpers de texto / scoring --------------------
-
-def _domain_weight(url: str) -> int:
-    try:
-        ext = tldextract.extract(url)
-    except Exception:
-        return 0
-    dom = f"{ext.domain}.{ext.suffix}".lower()
-    w = 0
-    for k, v in WHITELIST_WEIGHT.items():
-        # TLD puros (gov/edu)
-        if k == ext.suffix:
-            w = max(w, v)
-        # dominio incluido
-        if k in dom:
-            w = max(w, v)
-    return w
-
+# ---------- Utilidades NLP
 def _tokenize(s: str) -> list[str]:
-    return re.findall(r"[a-záéíóúüñ0-9]+", s.lower())
+    return re.findall(r"[a-záéíóúüñ0-9]+", (s or "").lower())
 
-def _tf(sent: str, q_terms: set[str]) -> float:
-    toks = _tokenize(sent)
-    c = Counter(toks)
-    return sum(c[t] for t in q_terms) / (1 + len(toks))
+def _to_vec(text: str) -> Counter: return Counter(_tokenize(text))
 
 def _cos(a: Counter, b: Counter) -> float:
-    inter = set(a) & set(b)
-    num = sum(a[t]*b[t] for t in inter)
-    na = math.sqrt(sum(v*v for v in a.values()))
-    nb = math.sqrt(sum(v*v for v in b.values()))
-    return 0.0 if na == 0 or nb == 0 else num/(na*nb)
+    inter = set(a) & set(b); num = sum(a[t]*b[t] for t in inter)
+    na = sum(v*v for v in a.values())**0.5; nb = sum(v*v for v in b.values())**0.5
+    return 0.0 if na==0 or nb==0 else num/(na*nb)
 
-def _to_vec(text: str) -> Counter:
-    return Counter(_tokenize(text))
-
-def _mmr_select(candidates: list[str], q: str, k: int = 24, lam: float = 0.75) -> list[str]:
-    """Selección MMR simple (diversidad) sobre bolsa de palabras."""
-    qv = _to_vec(q)
-    cand_vecs = [_to_vec(c) for c in candidates]
-    selected: list[str] = []
-    used_idx: set[int] = set()
-    while len(selected) < min(k, len(candidates)):
-        best_i, best_score = None, -1e9
-        for i, vec in enumerate(cand_vecs):
-            if i in used_idx:
-                continue
-            rel = _cos(vec, qv)
-            div = max((_cos(vec, _to_vec(s)) for s in selected), default=0.0)
+def _mmr_select(cands: list[str], q: str, k: int = 40, lam: float = .75) -> list[str]:
+    qv = _to_vec(q); vecs = [_to_vec(c) for c in cands]; sel, used = [], set()
+    while len(sel) < min(k, len(cands)):
+        best_i, best = None, -1e9
+        for i, v in enumerate(vecs):
+            if i in used: continue
+            rel = _cos(v, qv)
+            div = max((_cos(v, _to_vec(s)) for s in sel), default=0.0)
             score = lam*rel - (1-lam)*div
-            if score > best_score:
-                best_score, best_i = score, i
-        used_idx.add(best_i)  # type: ignore[arg-type]
-        selected.append(candidates[best_i])  # type: ignore[index]
-    return selected
+            if score > best: best, best_i = score, i
+        if best_i is None: break
+        used.add(best_i); sel.append(cands[best_i])
+    return sel
 
 def _split_sentences(text: str) -> list[str]:
-    text = re.sub(r"\s+", " ", text)
-    sents = re.split(r"(?<=[\.\!\?])\s+(?=[A-ZÁÉÍÓÚÜÑ])", text)
-    return [s.strip() for s in sents if 40 <= len(s.strip()) <= 300]
+    text = re.sub(r"\s+", " ", text or "")
+    out = re.split(r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ])", text)
+    return [s.strip() for s in out if 40 <= len(s) <= 400]
 
-def _classify(sent: str) -> str|None:
-    s = sent.lower()
-    for key, kws in SPANISH_SECTIONS.items():
-        if any(kw in s for kw in kws):
-            return key
+def _classify(sent: str) -> str | None:
+    s = (sent or "").lower()
+    for k, kws in SPANISH_SECTIONS.items():
+        if any(kw in s for kw in kws): return k
     return None
 
-def _extract_doses(texts: list[str]) -> list[str]:
-    found: list[str] = []
-    for t in texts:
-        for m in DOSIS_RX.finditer(t):
-            drug = re.sub(r"\s{2,}", " ", m.group("drug")).strip(" .,:;")
-            dose = m.group("dose")
-            every = m.group("int")
-            piece = f"- {drug}: {dose}"
-            if every:
-                piece += f" cada {every} h"
-            # evita duplicados case-insensitive
-            if piece.lower() not in (x.lower() for x in found):
-                found.append(piece)
-    return found[:8]
+def _normalize_sentence(s: str) -> str:
+    s = re.sub(r"\s+", " ", (s or "")).strip()
+    s = re.sub(r"https?://\S+", "", s)
+    s = re.sub(r"\s*\(.*?\)", "", s)
+    s = s.replace("..",".").strip(". ")
+    return (s[0].upper()+s[1:]) if s else s
 
-# -------------------- Resumen estructurado --------------------
+def _summarize(sents: list[str], n: int) -> list[str]:
+    seen, out = set(), []
+    for s in sents:
+        s = _normalize_sentence(s)
+        if not s: continue
+        key = re.sub(r"[^a-z0-9áéíóúüñ ]","", s.lower())
+        if key in seen: continue
+        seen.add(key)
+        out.append("• " + (s if len(s) <= 220 else (s.split(". ")[0]+ ".")))
+        if len(out) >= n: break
+    return out
 
-def build_structured_markdown(query: str, cleaned_docs: list[dict]) -> tuple[str, list[str]]:
-    """
-    Recibe documentos LIMPIOS: [{title,url,text}, ...]
-    Devuelve (markdown, citas_urls) con estructura clínica en castellano.
-    """
+def _is_surgical_relevant(texts: list[str]) -> bool:
+    blob = " ".join(texts).lower()
+    return any(t in blob for t in ("cirug","quirúrg","operaci","resecc","injerto"))
+
+# ---------- Cobertura mínima para “corte temprano”
+REQUIRED_SECTIONS = ("definicion", "sintomas", "diagnostico", "tratamiento")
+def _coverage_ok(buckets: dict[str, list[str]]) -> bool:
+    return all(buckets.get(sec) for sec in REQUIRED_SECTIONS)
+
+# ---------- Ranking por evidencia / dominio
+PENALIZE_DOMAINS = ("wikipedia.org","youtube.com","youtu.be")
+def _domain_bonus(url: str, preferred: list[str]) -> float:
+    url = (url or "").lower()
+    if any(bad in url for bad in PENALIZE_DOMAINS): return -0.5
+    if any(p in url for p in preferred):            return +0.6
+    return 0.0
+
+# ---------- Render
+def build_structured_markdown(query: str, cleaned_docs: list[dict], preferred_domains: list[str]) -> tuple[str, list[str]]:
     docs = [d for d in cleaned_docs if d.get("text")]
     if not docs:
-        return f"**Pregunta:** {query}\n\n_No hay contenido suficiente para resumir._", []
+        return f"**Pregunta:** {query}\n\n_No hay información suficiente._", []
 
     q_terms = {t for t in _tokenize(query) if len(t) >= 3}
+    expected_specs = detect_specialties(query)
 
-    # 1) Peso por confianza de dominio
-    doc_weights: list[tuple[float, dict]] = []
+    weighted: list[tuple[float,str,dict]] = []
     for d in docs:
-        w = float(_domain_weight(d.get("url", "")))
-        doc_weights.append((w, d))
-    doc_weights.sort(key=lambda x: x[0], reverse=True)
-
-    # 2) Universo de frases con score de relevancia
-    candidate_sents: list[tuple[float, str]] = []
-    for w, d in doc_weights:
-        sents = _split_sentences(d["text"])
-        for s in sents:
-            rel = _tf(s, q_terms)
-            score = rel + 0.15 * w
+        url = d.get("url",""); title = d.get("title",""); text = d.get("text") or ""
+        ev = evidence_score(text[:2000], url, title)
+        bonus = _domain_bonus(url, preferred_domains)
+        for s in _split_sentences(text):
+            tf = sum(1 for t in q_terms if t in s.lower()) / (1 + len(s))
+            sp = score_specialty(s, expected_specs)
+            score = tf + 0.25*ev + 0.15*sp + bonus
             if score > 0:
-                candidate_sents.append((score, s))
+                weighted.append((score, s, d))
 
-    if not candidate_sents:
-        backup = []
-        for _, d in doc_weights:
-            backup.extend(_split_sentences(d["text"])[:8])
-        backup = [b for b in backup if 40 <= len(b) <= 300]
-        picked = _mmr_select(backup, query, k=24, lam=0.75)
-    else:
-        candidate_sents.sort(key=lambda x: (-x[0], len(x[1])))
-        top = [s for _, s in candidate_sents[:220]]
-        picked = _mmr_select(top, query, k=24, lam=0.75)
+    if not weighted:
+        for d in docs:
+            for s in _split_sentences(d.get("text",""))[:8]:
+                weighted.append((0.1, s, d))
 
-    # 3) Clasificar por secciones
-    buckets = defaultdict(list)
+    weighted.sort(key=lambda x: -x[0])
+    picked = _mmr_select([s for _,s,_ in weighted][:300], query, k=40)
+
+    buckets: dict[str, list[str]] = defaultdict(list)
     for s in picked:
-        tag = _classify(s) or "otros"
-        buckets[tag].append("• " + s)
+        buckets[_classify(s) or "otros"].append(s)
 
-    # 4) Dosis
-    doses = _extract_doses(picked)
+    dose_rows = extract_dose_table(picked)
+    surgical_relevant = _is_surgical_relevant(picked)
 
-    # 5) Puntos clave
-    key_points = ["– " + s for s in picked[:6]]
+    sec: list[str] = [f"**Pregunta:** {query}\n"]
 
-    # 6) Referencias (únicas, priorizando confiables)
-    citations: list[str] = []
-    seen_c = set()
-    for _, d in doc_weights:
-        u = d.get("url")
-        if u and u not in seen_c:
-            seen_c.add(u)
-            citations.append(u)
-        if len(citations) >= 8:
-            break
+    if buckets.get("definicion"):
+        sec.append("## Definición y Epidemiología")
+        sec += _summarize(buckets["definicion"], 6)
 
-    # 7) Fallbacks para secciones vacías
-    def _fallback(tag: str, alt_from: list[str]) -> list[str]:
-        if buckets.get(tag):
-            return buckets[tag]
-        for s in alt_from:
-            if len(s) > 60:
-                return ["• " + s]
-        return []
-
-    alt = picked
-    defin = _fallback("definicion", alt)
-    sx    = _fallback("sintomas",   alt)
-    dx    = _fallback("diagnostico",alt)
-    tx    = _fallback("tratamiento",alt)
-    cx    = _fallback("conducta",   alt)
-
-    # 8) Render Markdown
-    sec: list[str] = []
-    sec.append(f"**Pregunta:** {query}\n")
-
-    sec.append("## Puntos clave")
-    sec.append("\n".join(key_points) if key_points else "– Sin hallazgos clave.")
-
-    if defin:
-        sec.append("\n## Definición")
-        sec.append("\n".join(defin[:6]))
-
-    if sx:
+    if buckets.get("sintomas"):
         sec.append("\n## Síntomas")
-        sec.append("\n".join(sx[:10]))
+        sec += _summarize(buckets["sintomas"], 10)
 
-    if dx:
+    if buckets.get("diagnostico"):
         sec.append("\n## Diagnóstico")
-        sec.append("\n".join(dx[:10]))
+        sec.append("**Métodos clínicos y complementarios:**")
+        sec += _summarize(buckets["diagnostico"], 10)
 
-    if tx:
+    if buckets.get("tratamiento"):
         sec.append("\n## Tratamiento")
-        sec.append("\n".join(tx[:12]))
+        conserv = [s for s in buckets["tratamiento"] if any(x in s.lower() for x in ("rehab","repos","hidrat","no farmac","educac","ejerc"))]
+        if conserv:
+            sec.append("**Tratamiento conservador:**")
+            sec += _summarize(conserv, 6)
 
-    if doses:
-        sec.append("\n**Dosis (orientativas; confirmar con guía local):**")
-        sec.append("\n".join(doses))
+        medic = [s for s in buckets["tratamiento"] if any(x in s.lower() for x in ("antib","analg","antiinflam","farmac","insulin","metformin","antihipert"))]
+        if medic:
+            sec.append("\n**Tratamiento medicamentoso:**")
+            sec += _summarize(medic, 8)
 
-    if cx:
-        sec.append("\n## Conducta / Seguimiento")
-        sec.append("\n".join(cx[:10]))
+        if dose_rows:
+            sec.append("\n**Dosis (según guías; confirmar con contexto local):**")
+            sec.append(doses_to_markdown(dose_rows))
 
+        if surgical_relevant:
+            surg = [s for s in buckets["tratamiento"] if "cirug" in s.lower() or "oper" in s.lower() or "resecc" in s.lower()]
+            if surg:
+                sec.append("\n**Tratamiento quirúrgico:**")
+                sec += _summarize(surg, 4)
+
+    if buckets.get("conducta"):
+        sec.append("\n## Conducta y Seguimiento")
+        sec += _summarize(buckets["conducta"], 8)
+
+    suggestions = [
+        f"Pronóstico y complicaciones de {query.lower()}",
+        f"Diferencial de {query.lower()} por especialidad",
+        f"Nuevas guías y terapias actualizadas para {query.lower()}",
+        f"Prevención / profilaxis en {query.lower()}",
+    ]
+    random.shuffle(suggestions)
+    sec.append("\n## Otras sugerencias")
+    sec += [f"- {s}" for s in suggestions[:3]]
+
+    # referencias ordenadas por evidencia + bonus dominio
+    url_best: dict[str, float] = {}
+    for _, _, d in weighted:
+        u = d.get("url")
+        if not u: continue
+        ev = evidence_score((d.get("text") or "")[:2000], u, d.get("title",""))
+        url_best[u] = max(url_best.get(u, -9e9), ev + _domain_bonus(u, preferred_domains))
+
+    citations = [u for u,_ in sorted(url_best.items(), key=lambda x: -x[1])][:12]
     sec.append("\n## Referencias principales")
-    if citations:
-        sec.append("\n".join(f"{i+1}. {u}" for i, u in enumerate(citations, 1)))
-    else:
-        sec.append("– (sin referencias)")
+    sec += [f"{i+1}. {u}" for i,u in enumerate(citations,1)] if citations else ["– (sin referencias)"]
 
-    md = "\n".join(sec).strip()
-    return md, citations
+    return "\n".join(sec).strip(), citations
 
-# -------------------- Pipeline --------------------
-
+# ---------- Pipeline
 class NOTAPipeline:
     """
-    1) Busca local.
-    2) Si no alcanza, busca web con search_client (inyectado).
-    3) Limpia, fusiona, estructura y devuelve Markdown + citas.
+    Orden de búsqueda:
+      1) DB local (LocalMedicalSearcher)
+      2) iOS FTS (medical_fts.sqlite)
+      3) Sitios nacionales preferidos (site:dominio)
+      4) Resto de la web (filtro por evidencia y penalizaciones)
+    Se detiene temprano si la cobertura de secciones es suficiente.
     """
-    def __init__(self, db_dir: str = "./data", search_client=None):
+    def __init__(self, db_dir: str, search_client, ios_fts_db: Optional[str], output_db: Optional[str], preferred_domains: Optional[List[str]] = None):
         self.searcher = LocalMedicalSearcher(db_dir)
+        self.ios_fts = IOSFTSSearcher(ios_fts_db) if ios_fts_db and len(ios_fts_db) else None
         self.search = search_client
-        self.output_db = f"{db_dir}/output.db"
+        self.cache_db = f"{db_dir.rstrip('/')}/cache.db"
+        self.preferred_domains = preferred_domains or []
+
+    async def _render_if_complete(self, q: str, docs: List[dict]) -> Tuple[bool, Tuple[dict,str]]:
+        md, cits = build_structured_markdown(q, docs, self.preferred_domains)
+        # chequea cobertura
+        # volvemos a clasificar rápido para ver cobertura
+        buckets = defaultdict(list)
+        for s in _mmr_select([ss for d in docs for ss in _split_sentences(d.get("text",""))][:300], q, k=40):
+            buckets[_classify(s) or "otros"].append(s)
+        if _coverage_ok(buckets):
+            notes = {"citations": cits}
+            return True, (notes, md)
+        return False, ({}, md)
 
     async def run(self, q: str) -> Tuple[dict, str]:
-        q = q.strip()
-        notes = {"query_norm": q, "citations": [], "local_added": 0, "web_added": 0}
-
+        q = (q or "").strip()
+        notes = {"query_norm": q, "citations": [], "local_added": 0, "ios_fts_added": 0, "web_added": 0, "cache_hits": 0}
         if not q:
             return notes, "⚠️ Pregunta vacía."
 
-        # 1) LOCAL
-        local = await self.searcher.search(q, top_k=8)
+        # 1) Local DB
+        docs: List[dict] = []
+        local = await self.searcher.search(q, top_k=10)
         if local:
-            local_texts = [{"title": r.get("title",""), "url": r.get("url",""), "text": r["content"]} for r in local]
-            md, cits = build_structured_markdown(q, local_texts)
-            notes["citations"] = cits
-            return notes, md
+            docs.extend({"title": r.get("title",""), "url": r.get("url",""), "text": r.get("content","")} for r in local)
+            notes["local_added"] = len(local)
+            done, result = await self._render_if_complete(q, docs)
+            if done:
+                notes["citations"] = result[0]["citations"]; return notes, result[1]
 
-        # 2) WEB (si hay search_client)
-        cleaned: list[dict] = []
+        # 2) iOS FTS
+        if self.ios_fts:
+            ios_hits = self.ios_fts.search(q, top_k=10)
+            if ios_hits:
+                docs.extend({"title": r.get("title",""), "url": r.get("url",""), "text": r.get("content","")} for r in ios_hits)
+                notes["ios_fts_added"] = len(ios_hits)
+                done, result = await self._render_if_complete(q, docs)
+                if done:
+                    notes["citations"] = result[0]["citations"]; return notes, result[1]
+
+        # 3) Sitios preferidos (MINSAL, Intramed, …)
+        if self.search and self.preferred_domains:
+            preferred_docs: List[dict] = []
+            for dom in self.preferred_domains:
+                try:
+                    hits = await self.search.search(f"site:{dom} {q}", count=4)
+                except Exception:
+                    hits = []
+                for it in hits:
+                    url = it.get("url"); name = it.get("name","") or ""
+                    if not url: continue
+                    txt, from_cache = await cached_fetch_and_clean(url, db_path=self.cache_db, ttl_hours=24*7, return_flag=True)
+                    if from_cache: notes["cache_hits"] += 1
+                    if txt:
+                        preferred_docs.append({"title": name, "url": url, "text": txt})
+            if preferred_docs:
+                docs.extend(preferred_docs)
+                notes["web_added"] += len(preferred_docs)
+                done, result = await self._render_if_complete(q, docs)
+                if done:
+                    notes["citations"] = result[0]["citations"]; return notes, result[1]
+
+        # 4) Resto de la web
         if self.search:
             try:
-                hits = await self.search.search(q, count=8)
+                hits = await self.search.search(q, count=10)
             except Exception:
                 hits = []
+            web_docs: List[dict] = []
             for it in hits:
-                url = it.get("url");  name = it.get("name","")
-                if not url:
-                    continue
-                try:
-                    txt = await fetch_and_clean(url)
-                except Exception:
-                    txt = ""
-                if not txt:
-                    continue
-                cleaned.append({"title": name, "url": url, "text": txt})
-            notes["web_added"] = len(cleaned)
+                url = it.get("url"); name = it.get("name","") or ""
+                if not url: continue
+                txt, from_cache = await cached_fetch_and_clean(url, db_path=self.cache_db, ttl_hours=24*7, return_flag=True)
+                if from_cache: notes["cache_hits"] += 1
+                if txt:
+                    web_docs.append({"title": name, "url": url, "text": txt})
+            if web_docs:
+                docs.extend(web_docs)
+                notes["web_added"] += len(web_docs)
 
-        if cleaned:
-            md, cits = build_structured_markdown(q, cleaned)
-            notes["citations"] = cits
-            return notes, md
-
-        # 3) Sin resultados
-        return notes, f"**Pregunta:** {q}\n\nNo encontré información suficiente en la base ni en la web."
+        # Render final (lo que tengamos)
+        md, cits = build_structured_markdown(q, docs, self.preferred_domains)
+        notes["citations"] = cits
+        return notes, md
