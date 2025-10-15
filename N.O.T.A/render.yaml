@@ -1,0 +1,71 @@
+services:
+  - type: web
+    name: nota-backend
+    env: python
+    plan: free
+    branch: main
+    autoDeploy: true
+
+    healthCheckPath: /health
+
+    buildCommand: |
+      python -m pip install --upgrade pip setuptools wheel
+      pip install --no-cache-dir -r backend/requirements.txt
+
+    startCommand: >
+      uvicorn backend.app:app
+      --host 0.0.0.0 --port $PORT
+      --proxy-headers --forwarded-allow-ips="*"
+      --timeout-keep-alive 65
+
+    # Si quieres multiproceso en planes con >1 CPU, cambia por:
+    # startCommand: >
+    #   gunicorn backend.app:app
+    #   -k uvicorn.workers.UvicornWorker
+    #   --bind 0.0.0.0:$PORT
+    #   --workers ${WEB_CONCURRENCY:-1}
+    #   --timeout 120
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+
+      # Directorio de datos (persistente)
+      - key: DATA_DIR
+        value: /opt/render/project/src/backend/data
+
+      # CORS (ajústalo con tus dominios de front en prod)
+      - key: ALLOWED_ORIGINS
+        value: "*"
+
+      # Búsqueda web
+      - key: SEARCH_ENGINE
+        value: GOOGLE
+
+      # Rutas a tus SQLite locales (van dentro del disco montado)
+      - key: IOS_FTS_DB
+        value: /opt/render/project/src/backend/data/medical_fts.sqlite
+      - key: OUTPUT_DB
+        value: /opt/render/project/src/backend/data/output.db
+
+      # Dominios preferidos (ranking)
+      - key: PREFERRED_DOMAINS
+        value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
+
+      # === Claves (pon el valor en el panel de Render; sync:false evita exponerlas en YAML) ===
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: GOOGLE_CX
+        sync: false
+      - key: BING_KEY
+        sync: false
+      - key: BING_ENDPOINT
+        value: https://api.bing.microsoft.com/v7.0/search
+      - key: BING_MKT
+        value: es-CL
+
+    # Disco persistente para caches/DBs
+    disk:
+      name: nota-data
+      mountPath: /opt/render/project/src/backend/data
+      sizeGB: 1
