@@ -1,7 +1,7 @@
 services:
   - type: web
     name: nota-backend
-    runtime: python         # <— usa runtime explícito
+    runtime: python           # (nuevo esquema)
     plan: free
     branch: main
     autoDeploy: true
@@ -27,15 +27,21 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
+
       - key: ENV
         value: production
       - key: ENABLE_DOCS
         value: "false"
+
+      # CORS
       - key: ALLOWED_ORIGINS
         value: "*"
-      - key: TRUSTED_HOSTS
-        value: "nota-backend.onrender.com,.onrender.com"
 
+      # MUY IMPORTANTE: hosts de confianza (comodín para Render)
+      - key: TRUSTED_HOSTS
+        value: "*.onrender.com,localhost,127.0.0.1"
+
+      # Rutas de datos (efímeras, válidas en Render)
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -43,16 +49,19 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
+      # Motor de búsqueda y ranking
       - key: SEARCH_ENGINE
         value: GOOGLE
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
+      # (Opcional) URLs para bajar las SQLite
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
+      # Claves — pon el valor en el dashboard
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -63,5 +72,7 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
+
+      # (Opcional) proteger /chat con API key de servidor
       - key: SERVER_API_KEY
         sync: false
