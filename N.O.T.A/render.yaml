@@ -18,41 +18,31 @@ services:
       --proxy-headers --forwarded-allow-ips="*"
       --timeout-keep-alive 65
 
-    # Si quieres multiproceso en planes con >1 CPU, cambia por:
-    # startCommand: >
-    #   gunicorn backend.app:app
-    #   -k uvicorn.workers.UvicornWorker
-    #   --bind 0.0.0.0:$PORT
-    #   --workers ${WEB_CONCURRENCY:-1}
-    #   --timeout 120
-
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
 
-      # Directorio de datos (persistente)
+      # Datos locales (persistentes en el disco)
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
-
-      # CORS (ajústalo con tus dominios de front en prod)
-      - key: ALLOWED_ORIGINS
-        value: "*"
-
-      # Búsqueda web
-      - key: SEARCH_ENGINE
-        value: GOOGLE
-
-      # Rutas a tus SQLite locales (van dentro del disco montado)
       - key: IOS_FTS_DB
         value: /opt/render/project/src/backend/data/medical_fts.sqlite
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
-      # Dominios preferidos (ranking)
+      # CORS (ajústalo en prod)
+      - key: ALLOWED_ORIGINS
+        value: "*"
+
+      # Motor de búsqueda
+      - key: SEARCH_ENGINE
+        value: GOOGLE
+
+      # Opcional: prioriza dominios “buenos”
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # === Claves (pon el valor en el panel de Render; sync:false evita exponerlas en YAML) ===
+      # === Claves (configúralas en el dashboard) ===
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -64,7 +54,6 @@ services:
       - key: BING_MKT
         value: es-CL
 
-    # Disco persistente para caches/DBs
     disk:
       name: nota-data
       mountPath: /opt/render/project/src/backend/data
