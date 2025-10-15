@@ -12,7 +12,7 @@ services:
       python -m pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r backend/requirements.txt
 
-      # 👇 (opcional) descarga los .sqlite dentro del mismo paso de build
+      # ↓ Descarga opcional de DBs locales (válido en plan free dentro del build)
       mkdir -p backend/data
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
         echo "Descargando medical_fts.sqlite..."
@@ -33,6 +33,19 @@ services:
       - key: PYTHON_VERSION
         value: 3.12.6
 
+      # App config
+      - key: ENV
+        value: production
+      - key: ENABLE_DOCS
+        value: "false"
+      - key: ALLOWED_ORIGINS
+        value: "*"
+      - key: TRUSTED_HOSTS
+        value: "nota-backend.onrender.com,.onrender.com"
+      # - key: WEB_CONCURRENCY
+      #   value: "1"
+
+      # Rutas de datos (dentro de la imagen)
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -40,20 +53,19 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
-      - key: ALLOWED_ORIGINS
-        value: "*"
-
+      # Búsqueda
       - key: SEARCH_ENGINE
         value: GOOGLE
-
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
+      # URLs (se recomiendan firmadas/públicas solo lectura)
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
+      # Claves (poner valores en el dashboard, no en el YAML)
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -64,3 +76,7 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
+
+      # API Key del backend (opcional, para /chat)
+      - key: SERVER_API_KEY
+        sync: false

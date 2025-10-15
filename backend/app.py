@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.middleware.httpsredirect import HTTPSRedirectMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from dotenv import dotenv_values
 
@@ -42,7 +42,7 @@ PREFERRED_DOMAINS = [
 # -----------------------------------------------------------------------------
 # FastAPI (oculta docs en prod por defecto)
 # -----------------------------------------------------------------------------
-show_docs = ENV == "development" or (cfg.get("ENABLE_DOCS", "false").lower() in ("1","true","yes"))
+show_docs = ENV == "development" or (cfg.get("ENABLE_DOCS", "false").lower() in ("1", "true", "yes"))
 app = FastAPI(
     title="N.O.T.A",
     version="0.5",
@@ -58,7 +58,8 @@ app.add_middleware(
     allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*, Authorization, X-API-Key"],
+    # ✅ FIX: lista válida (o simplemente ["*"])
+    allow_headers=["*", "Authorization", "X-API-Key"],
 )
 app.add_middleware(GZipMiddleware, minimum_size=800)
 
@@ -154,14 +155,14 @@ async def chat(body: ChatIn, request: Request):
     notes, answer = await pipe.run(body.q)
     return ChatOut(answer=answer, notes=notes, citations=notes.get("citations", []))
 
-# (Útil para probar rápido desde el navegador)
+# GET de prueba rápida desde navegador
 @app.get("/chat", response_model=ChatOut)
 async def chat_get(q: str, request: Request):
     _require_api_key(request)
     notes, answer = await pipe.run(q)
     return ChatOut(answer=answer, notes=notes, citations=notes.get("citations", []))
 
-# Diagnóstico (mejor dejarlo activo sólo con ENABLE_DOCS o ENV=development)
+# Diagnóstico (solo dev o si ENABLE_DOCS=true)
 @app.get("/debug/env")
 def debug_env():
     if ENV != "development" and not show_docs:
