@@ -1,7 +1,7 @@
 services:
   - type: web
     name: nota-backend
-    env: python
+    env: python            # (puedes usar runtime: python si prefieres el esquema nuevo)
     plan: free
     branch: main
     autoDeploy: true
@@ -12,6 +12,18 @@ services:
       python -m pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r backend/requirements.txt
 
+    # Descarga opcional de las SQLite antes de arrancar (si defines URLs como env vars en el dashboard)
+    preDeployCommand: |
+      mkdir -p backend/data
+      if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
+        echo "Descargando medical_fts.sqlite..."
+        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || echo "No se pudo descargar medical_fts.sqlite"
+      fi
+      if [ -n "$GCS_OUTPUT_DB_URL" ]; then
+        echo "Descargando output.db..."
+        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || echo "No se pudo descargar output.db"
+      fi
+
     startCommand: >
       uvicorn backend.app:app
       --host 0.0.0.0 --port $PORT
@@ -19,10 +31,11 @@ services:
       --timeout-keep-alive 65
 
     envVars:
+      # Fuerza Python 3.12 para evitar builds de pydantic-core en mac/arm
       - key: PYTHON_VERSION
         value: 3.12.6
 
-      # Datos locales (persistentes en el disco)
+      # Rutas de datos dentro del contenedor
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -30,19 +43,25 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
-      # CORS (ajústalo en prod)
+      # CORS (en prod, limita a tus dominios)
       - key: ALLOWED_ORIGINS
         value: "*"
 
-      # Motor de búsqueda
+      # Buscador
       - key: SEARCH_ENGINE
         value: GOOGLE
 
-      # Opcional: prioriza dominios “buenos”
+      # Ranking: dominios preferidos (opcional)
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # === Claves (configúralas en el dashboard) ===
+      # URLs opcionales para bajar los .sqlite (pon VALORES en el Dashboard)
+      - key: GCS_MEDICAL_FTS_URL
+        sync: false
+      - key: GCS_OUTPUT_DB_URL
+        sync: false
+
+      # Claves (pon VALORES en el Dashboard, no en el YAML)
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -53,8 +72,3 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
-
-    disk:
-      name: nota-data
-      mountPath: /opt/render/project/src/backend/data
-      sizeGB: 1
