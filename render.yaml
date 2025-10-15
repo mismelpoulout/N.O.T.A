@@ -1,7 +1,7 @@
 services:
   - type: web
     name: nota-backend
-    runtime: python           # (nuevo esquema)
+    runtime: python
     plan: free
     branch: main
     autoDeploy: true
@@ -12,10 +12,12 @@ services:
       pip install --no-cache-dir -r backend/requirements.txt
       mkdir -p backend/data
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
-        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || true
+        echo "Descargando medical_fts.sqlite..."
+        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || echo "⚠️ No se pudo descargar medical_fts.sqlite"
       fi
       if [ -n "$GCS_OUTPUT_DB_URL" ]; then
-        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || true
+        echo "Descargando output.db..."
+        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || echo "⚠️ No se pudo descargar output.db"
       fi
 
     startCommand: >
@@ -25,6 +27,7 @@ services:
       --timeout-keep-alive 65
 
     envVars:
+      # Forzamos Python 3.12 por compatibilidad (Render por defecto usa 3.13)
       - key: PYTHON_VERSION
         value: 3.12.6
 
@@ -37,11 +40,11 @@ services:
       - key: ALLOWED_ORIGINS
         value: "*"
 
-      # MUY IMPORTANTE: hosts de confianza (comodín para Render)
+      # HOSTS PERMITIDOS
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
 
-      # Rutas de datos (efímeras, válidas en Render)
+      # Rutas internas
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -49,19 +52,19 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
-      # Motor de búsqueda y ranking
+      # Motor de búsqueda
       - key: SEARCH_ENGINE
         value: GOOGLE
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # (Opcional) URLs para bajar las SQLite
+      # Bases SQLite externas (opcional)
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
-      # Claves — pon el valor en el dashboard
+      # Claves API (se agregan manualmente en el dashboard)
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -73,6 +76,6 @@ services:
       - key: BING_MKT
         value: es-CL
 
-      # (Opcional) proteger /chat con API key de servidor
+      # Clave privada opcional (para proteger /chat)
       - key: SERVER_API_KEY
         sync: false
