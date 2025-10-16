@@ -1,7 +1,8 @@
 services:
   - type: web
     name: nota-backend
-    runtime: python
+    env: python
+    pythonVersion: 3.12.6          # 🔥 Fuerza la versión de Python real
     plan: free
     branch: main
     autoDeploy: true
@@ -12,9 +13,11 @@ services:
       pip install --no-cache-dir -r requirements.txt
       mkdir -p backend/data
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
+        echo "Descargando medical_fts.sqlite..."
         curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || true
       fi
       if [ -n "$GCS_OUTPUT_DB_URL" ]; then
+        echo "Descargando output.db..."
         curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || true
       fi
 
@@ -25,19 +28,20 @@ services:
       --timeout-keep-alive 65
 
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.6
-
       - key: ENV
         value: production
       - key: ENABLE_DOCS
         value: "false"
 
+      # CORS
       - key: ALLOWED_ORIGINS
         value: "*"
+
+      # Hosts seguros
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
 
+      # Rutas internas de datos
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -45,16 +49,19 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
+      # Motor de búsqueda
       - key: SEARCH_ENGINE
         value: GOOGLE
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
+      # Bases SQLite opcionales
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
+      # Claves API (ponlas en el Dashboard)
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -65,6 +72,5 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
-
       - key: SERVER_API_KEY
         sync: false
