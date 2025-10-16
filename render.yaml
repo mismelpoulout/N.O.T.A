@@ -2,6 +2,7 @@ services:
   - type: web
     name: nota-backend
     runtime: python
+    pythonVersion: 3.12.6
     plan: free
     branch: main
     autoDeploy: true
@@ -9,15 +10,15 @@ services:
 
     buildCommand: |
       python -m pip install --upgrade pip setuptools wheel
-      pip install --no-cache-dir -r backend/requirements.txt
+      pip install --no-cache-dir -r requirements.txt
       mkdir -p backend/data
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
         echo "Descargando medical_fts.sqlite..."
-        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || echo "⚠️ No se pudo descargar medical_fts.sqlite"
+        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || echo "No se pudo descargar medical_fts.sqlite"
       fi
       if [ -n "$GCS_OUTPUT_DB_URL" ]; then
         echo "Descargando output.db..."
-        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || echo "⚠️ No se pudo descargar output.db"
+        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || echo "No se pudo descargar output.db"
       fi
 
     startCommand: >
@@ -27,24 +28,17 @@ services:
       --timeout-keep-alive 65
 
     envVars:
-      # Forzamos Python 3.12 por compatibilidad (Render por defecto usa 3.13)
       - key: PYTHON_VERSION
         value: 3.12.6
-
       - key: ENV
         value: production
       - key: ENABLE_DOCS
         value: "false"
-
-      # CORS
       - key: ALLOWED_ORIGINS
         value: "*"
-
-      # HOSTS PERMITIDOS
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
 
-      # Rutas internas
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
       - key: IOS_FTS_DB
@@ -52,19 +46,16 @@ services:
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
 
-      # Motor de búsqueda
       - key: SEARCH_ENGINE
         value: GOOGLE
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # Bases SQLite externas (opcional)
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
-      # Claves API (se agregan manualmente en el dashboard)
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -75,7 +66,5 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
-
-      # Clave privada opcional (para proteger /chat)
       - key: SERVER_API_KEY
         sync: false
