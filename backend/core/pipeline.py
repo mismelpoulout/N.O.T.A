@@ -1,382 +1,238 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
+import os, re, json, sqlite3, time
+from typing import List, Dict, Tuple, Optional
 
-import re, random
-from collections import Counter, defaultdict
-from typing import Tuple, Dict, List, Optional
+import numpy as np
 
-from backend.core.db.local_search import LocalMedicalSearcher
-from backend.core.db.ios_fts_search import IOSFTSSearcher
-from backend.core.cached_fetch import cached_fetch_and_clean  # async: (text, from_cache) si return_flag=True
-from backend.core.dose_parser import extract_dose_table, doses_to_markdown
-from backend.core.evidence import evidence_score
-from backend.core.specialties import detect_specialties, score_specialty
+from .embeddings import LocalEmbeddings, cosine_sim
+from .clin_sections import ClinSectionClassifier
+from .negation import is_negated
+from .ranker import Ranker, Hit
+from .llm_client import LLMClient
 
+PREF = set(d.strip() for d in os.getenv("PREFERRED_DOMAINS", "").split(",") if d.strip())
 
-# ---------- Secciones (palabras guía por bloque clínico)
-SPANISH_SECTIONS: dict[str, tuple[str, ...]] = {
-    "definicion": (
-        "definición","definicion","es una","se define","consiste",
-        "etiología","epidemiología","prevalencia","incidencia",
-        "clasificación","factores de riesgo"
-    ),
-    "sintomas": (
-        "síntoma","sintomas","signos","manifestaciones","cuadro clínico",
-        "dolor","tos","fiebre","disnea","cefalea","astenia","náuseas","vómitos"
-    ),
-    "diagnostico": (
-        "diagnóstico","criterios","diferencial","laboratorio","imagen",
-        "ecografía","radiografía","tac","rm","pcr","antígeno","biopsia","prueba"
-    ),
-    "tratamiento": (
-        "tratamiento","manejo","terapia","farmacológico","medicamentos",
-        "rehabilitación","no farmacológico","antibiótico","analgésico",
-        "antiinflamatorio","insulina","metformina","antihipertensivo",
-        "quirúrgico","cirugía","operación","resección","injerto"
-    ),
-    "conducta": (
-        "conducta","seguimiento","derivación","control","educación","alta",
-        "criterios de ingreso","banderas rojas","reevaluación","hospitalización"
-    ),
+_MIN_SENT_LEN = 40
+_MAX_SENT_LEN = 400
+
+# Mapea etiquetas de tu clasificador a encabezados “canónicos” del prompt
+SECTION_CANON = {
+    "definicion": "Motivo / Contexto",
+    "sintomas": "Síntomas",
+    "diagnostico": "Diagnóstico",
+    "examen": "Examen",
+    "tratamiento": "Plan",
+    "conducta": "Plan",
+    "otros": "Otros",
 }
 
-# ---------- Utilidades NLP simples
-def _tokenize(s: str) -> list[str]:
-    return re.findall(r"[a-záéíóúüñ0-9]+", (s or "").lower())
-
-def _to_vec(text: str) -> Counter:
-    return Counter(_tokenize(text))
-
-def _cos(a: Counter, b: Counter) -> float:
-    inter = set(a) & set(b)
-    num = sum(a[t] * b[t] for t in inter)
-    na = sum(v * v for v in a.values()) ** 0.5
-    nb = sum(v * v for v in b.values()) ** 0.5
-    return 0.0 if na == 0 or nb == 0 else num / (na * nb)
-
-def _mmr_select(cands: list[str], q: str, k: int = 40, lam: float = .75) -> list[str]:
-    """Maximal Marginal Relevance: diversidad + relevancia por bolsa de palabras."""
-    qv = _to_vec(q)
-    vecs = [_to_vec(c) for c in cands]
-    sel: list[str] = []
-    used: set[int] = set()
-    while len(sel) < min(k, len(cands)):
-        best_i, best = None, -1e9
-        for i, v in enumerate(vecs):
-            if i in used:
-                continue
-            rel = _cos(v, qv)
-            div = max((_cos(v, _to_vec(s)) for s in sel), default=0.0)
-            score = lam * rel - (1 - lam) * div
-            if score > best:
-                best, best_i = score, i
-        if best_i is None:
-            break
-        used.add(best_i)
-        sel.append(cands[best_i])
-    return sel
-
-def _split_sentences(text: str) -> list[str]:
-    text = re.sub(r"\s+", " ", text or "")
-    out = re.split(r"(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ])", text)
-    return [s.strip() for s in out if 40 <= len(s) <= 400]
-
-def _classify(sent: str) -> str | None:
-    s = (sent or "").lower()
-    for k, kws in SPANISH_SECTIONS.items():
-        if any(kw in s for kw in kws):
-            return k
-    return None
-
-def _normalize_sentence(s: str) -> str:
-    s = re.sub(r"\s+", " ", (s or "")).strip()
-    s = re.sub(r"https?://\S+", "", s)      # evita “meter” URLs en la oración
-    s = re.sub(r"\s*\(.*?\)", "", s)        # recorta paréntesis largos
-    s = s.replace("..", ".").strip(". ")
-    return (s[0].upper() + s[1:]) if s else s
-
-def _summarize(sents: list[str], n: int) -> list[str]:
-    """Dedup suave + primer enunciado si es muy largo."""
-    seen, out = set(), []
-    for s in sents:
-        s = _normalize_sentence(s)
-        if not s:
+def _split_sentences(text: str) -> List[str]:
+    """
+    Split por puntuación fuerte, limpia URLs, normaliza espacios
+    y restringe por longitud para evitar ruido.
+    """
+    if not text:
+        return []
+    s = re.sub(r"\s+", " ", text)
+    s = re.sub(r"https?://\S+", "", s)
+    # Cortes por . ! ? seguidos de espacio+mayúscula típica en ES
+    parts = re.split(r"(?<=[\.\!\?])\s+(?=[A-ZÁÉÍÓÚÜÑ])", s)
+    out = []
+    seen = set()
+    for p in parts:
+        p = p.strip().strip(". ")
+        if len(p) < _MIN_SENT_LEN or len(p) > _MAX_SENT_LEN:
             continue
-        key = re.sub(r"[^a-z0-9áéíóúüñ ]", "", s.lower())
+        key = re.sub(r"[^a-z0-9áéíóúüñ ]", "", p.lower())
         if key in seen:
             continue
         seen.add(key)
-        out.append("• " + (s if len(s) <= 220 else (s.split(". ")[0] + ".")))
-        if len(out) >= n:
-            break
+        out.append(p)
     return out
 
-def _is_surgical_relevant(texts: list[str]) -> bool:
-    blob = " ".join(texts).lower()
-    return any(t in blob for t in ("cirug", "quirúrg", "operaci", "resecc", "injerto"))
+def _canon_label(label: Optional[str]) -> str:
+    return SECTION_CANON.get((label or "otros"), "Otros")
 
-# ---------- Cobertura mínima para “corte temprano”
-REQUIRED_SECTIONS = ("definicion", "sintomas", "diagnostico", "tratamiento")
-def _coverage_ok(buckets: dict[str, list[str]]) -> bool:
-    return all(buckets.get(sec) for sec in REQUIRED_SECTIONS)
-
-# ---------- Ranking por evidencia / dominio
-PENALIZE_DOMAINS = ("wikipedia.org", "youtube.com", "youtu.be")
-def _domain_bonus(url: str, preferred: List[str]) -> float:
-    url = (url or "").lower()
-    if any(bad in url for bad in PENALIZE_DOMAINS):
-        return -0.5
-    if any(p in url for p in preferred):
-        return +0.6
-    return 0.0
-
-# ---------- Render principal
-def build_structured_markdown(query: str, cleaned_docs: List[dict], preferred_domains: List[str]) -> tuple[str, List[str]]:
-    """
-    Recibe [{title, url, text}, ...] y devuelve (markdown, citas)
-    con estructura clínica y referencias ordenadas.
-    """
-    docs = [d for d in cleaned_docs if d.get("text")]
-    if not docs:
-        return f"**Pregunta:** {query}\n\n_No hay información suficiente._", []
-
-    q_terms = {t for t in _tokenize(query) if len(t) >= 3}
-    expected_specs = detect_specialties(query)
-
-    # 1) Scoring de oraciones: relevancia (TF) + evidencia doc + match especialidad + bonus de dominio
-    weighted: List[tuple[float, str, dict]] = []
-    for d in docs:
-        url = d.get("url", "")
-        title = d.get("title", "")
-        text = d.get("text") or ""
-        ev = evidence_score(text[:2000], url, title)
-        bonus = _domain_bonus(url, preferred_domains)
-        for s in _split_sentences(text):
-            tf = sum(1 for t in q_terms if t in s.lower()) / (1 + len(s))
-            sp = score_specialty(s, expected_specs)
-            score = tf + 0.25 * ev + 0.15 * sp + bonus
-            if score > 0:
-                weighted.append((score, s, d))
-
-    if not weighted:
-        for d in docs:
-            for s in _split_sentences(d.get("text", ""))[:8]:
-                weighted.append((0.1, s, d))
-
-    weighted.sort(key=lambda x: -x[0])
-    picked = _mmr_select([s for _, s, _ in weighted][:300], query, k=40)
-
-    # 2) Agrupar por sección clínica
-    buckets: dict[str, List[str]] = defaultdict(list)
-    for s in picked:
-        buckets[_classify(s) or "otros"].append(s)
-
-    # 3) Utilidades
-    dose_rows = extract_dose_table(picked)
-    surgical_relevant = _is_surgical_relevant(picked)
-
-    # 4) Render
-    sec: List[str] = [f"**Pregunta:** {query}\n"]
-
-    if buckets.get("definicion"):
-        sec.append("## Definición y Epidemiología")
-        sec += _summarize(buckets["definicion"], 6)
-
-    if buckets.get("sintomas"):
-        sec.append("\n## Síntomas")
-        sec += _summarize(buckets["sintomas"], 10)
-
-    if buckets.get("diagnostico"):
-        sec.append("\n## Diagnóstico")
-        sec.append("**Métodos clínicos y complementarios:**")
-        sec += _summarize(buckets["diagnostico"], 10)
-
-    if buckets.get("tratamiento"):
-        sec.append("\n## Tratamiento")
-        # Conservador
-        conserv = [s for s in buckets["tratamiento"]
-                   if any(x in s.lower() for x in ("rehab", "repos", "hidrat", "no farmac", "educac", "ejerc"))]
-        if conserv:
-            sec.append("**Tratamiento conservador:**")
-            sec += _summarize(conserv, 6)
-
-        # Medicamentoso
-        medic = [s for s in buckets["tratamiento"]
-                 if any(x in s.lower() for x in ("antib", "analg", "antiinflam", "farmac", "insulin", "metformin", "antihipert"))]
-        if medic:
-            sec.append("\n**Tratamiento medicamentoso:**")
-            sec += _summarize(medic, 8)
-
-        # Dosis
-        if dose_rows:
-            sec.append("\n**Dosis (según guías; confirmar con contexto local):**")
-            sec.append(doses_to_markdown(dose_rows))
-
-        # Quirúrgico solo si procede
-        if surgical_relevant:
-            surg = [s for s in buckets["tratamiento"]
-                    if "cirug" in s.lower() or "oper" in s.lower() or "resecc" in s.lower()]
-            if surg:
-                sec.append("\n**Tratamiento quirúrgico:**")
-                sec += _summarize(surg, 4)
-
-    if buckets.get("conducta"):
-        sec.append("\n## Conducta y Seguimiento")
-        sec += _summarize(buckets["conducta"], 8)
-
-    # Sugerencias relacionadas (para UI con hover/click)
-    suggestions = [
-        f"Pronóstico y complicaciones de {query.lower()}",
-        f"Diferencial de {query.lower()} por especialidad",
-        f"Nuevas guías y terapias actualizadas para {query.lower()}",
-        f"Prevención / profilaxis en {query.lower()}",
-    ]
-    random.shuffle(suggestions)
-    sec.append("\n## Otras sugerencias")
-    sec += [f"- {s}" for s in suggestions[:3]]
-
-    # 5) Referencias principales (evidencia + bonus de dominio)
-    url_best: Dict[str, float] = {}
-    for _, _, d in weighted:
-        u = d.get("url")
-        if not u:
-            continue
-        ev = evidence_score((d.get("text") or "")[:2000], u, d.get("title", ""))
-        url_best[u] = max(url_best.get(u, -9e9), ev + _domain_bonus(u, preferred_domains))
-
-    citations = [u for u, _ in sorted(url_best.items(), key=lambda x: -x[1])][:12]
-    sec.append("\n## Referencias principales")
-    if citations:
-        sec += [f"{i+1}. {u}" for i, u in enumerate(citations, 1)]
-    else:
-        sec.append("– (sin referencias)")
-
-    return "\n".join(sec).strip(), citations
-
-
-# ---------- Pipeline orquestador
 class NOTAPipeline:
     """
-    Orden de búsqueda:
-      1) DB local (LocalMedicalSearcher)
-      2) iOS FTS (medical_fts.sqlite)
-      3) Sitios nacionales preferidos (site:dominio)
-      4) Resto de la web (con caché y filtros)
-    Corta temprano si ya hay cobertura de secciones clave.
+    RAG local sobre SQLite:
+      - Tabla chunks(id TEXT PRIMARY KEY, text TEXT, meta TEXT NULL)
+      - Tabla embeddings(chunk_id TEXT PRIMARY KEY, dim INT, vec BLOB)
     """
-    def __init__(
-        self,
-        db_dir: str,
-        search_client,
-        ios_fts_db: Optional[str] = None,
-        output_db: Optional[str] = None,  # reservado para futuros logs/salidas
-        preferred_domains: Optional[List[str]] = None,
-    ):
-        self.searcher = LocalMedicalSearcher(db_dir)
-        self.ios_fts = IOSFTSSearcher(ios_fts_db) if ios_fts_db else None
-        self.search = search_client
-        self.cache_db = f"{db_dir.rstrip('/')}/cache.db"
-        self.preferred_domains = preferred_domains or []
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.emb = LocalEmbeddings()
+        self.cls = ClinSectionClassifier(self.emb)
+        self.rank = Ranker(self.emb, PREF)
+        self.llm = LLMClient()
 
-    async def _render_if_complete(self, q: str, docs: List[dict]) -> Tuple[bool, Tuple[dict, str]]:
-        """Renderiza y valida cobertura de bloques clínicos mínimos."""
-        md, cits = build_structured_markdown(q, docs, self.preferred_domains)
-        # Re-chequeo rápido de cobertura con MMR sobre el pool actual
-        buckets = defaultdict(list)
-        sents = [ss for d in docs for ss in _split_sentences(d.get("text", ""))][:300]
-        for s in _mmr_select(sents, q, k=40):
-            buckets[_classify(s) or "otros"].append(s)
-        if _coverage_ok(buckets):
-            notes = {"citations": cits}
-            return True, (notes, md)
-        return False, ({}, md)
-
-    async def run(self, q: str) -> Tuple[dict, str]:
-        q = (q or "").strip()
-        notes: Dict[str, object] = {
-            "query_norm": q,
-            "citations": [],
-            "local_added": 0,
-            "ios_fts_added": 0,
-            "web_added": 0,
-            "cache_hits": 0,
-        }
-        if not q:
-            return notes, "⚠️ Pregunta vacía."
-
-        docs: List[dict] = []
-
-        # 1) Base local
-        local = await self.searcher.search(q, top_k=10)
-        if local:
-            docs.extend({"title": r.get("title", ""), "url": r.get("url", ""), "text": r.get("content", "")} for r in local)
-            notes["local_added"] = len(local)
-            done, result = await self._render_if_complete(q, docs)
-            if done:
-                notes["citations"] = result[0]["citations"]  # type: ignore[index]
-                return notes, result[1]
-
-        # 2) iOS FTS (SQLite con documentos clínicos)
-        if self.ios_fts:
-            ios_hits = self.ios_fts.search(q, top_k=10)
-            if ios_hits:
-                docs.extend({"title": r.get("title", ""), "url": r.get("url", ""), "text": r.get("content", "")} for r in ios_hits)
-                notes["ios_fts_added"] = len(ios_hits)
-                done, result = await self._render_if_complete(q, docs)
-                if done:
-                    notes["citations"] = result[0]["citations"]  # type: ignore[index]
-                    return notes, result[1]
-
-        # 3) Sitios preferidos (MINSAL, Intramed, etc.)
-        if self.search and self.preferred_domains:
-            preferred_docs: List[dict] = []
-            for dom in self.preferred_domains:
-                try:
-                    hits = await self.search.search(f"site:{dom} {q}", count=4)
-                except Exception:
-                    hits = []
-                for it in hits:
-                    url = it.get("url"); name = it.get("name", "") or ""
-                    if not url:
-                        continue
-                    txt, from_cache = await cached_fetch_and_clean(
-                        url, db_path=self.cache_db, ttl_hours=24 * 7, return_flag=True
-                    )
-                    if from_cache:
-                        notes["cache_hits"] = int(notes["cache_hits"]) + 1
-                    if txt:
-                        preferred_docs.append({"title": name, "url": url, "text": txt})
-            if preferred_docs:
-                docs.extend(preferred_docs)
-                notes["web_added"] = int(notes["web_added"]) + len(preferred_docs)
-                done, result = await self._render_if_complete(q, docs)
-                if done:
-                    notes["citations"] = result[0]["citations"]  # type: ignore[index]
-                    return notes, result[1]
-
-        # 4) Resto de la web
-        if self.search:
+    # ------------------- Recuperación local -------------------
+    def _load_all_embeddings(self) -> Tuple[List[str], List[str], Optional[np.ndarray], List[dict]]:
+        """
+        Devuelve: ids, texts, mat_emb (N x D) o None si vacío, metas (dict por chunk)
+        meta soporta claves opcionales: title, book_title, path, url, source, published_at
+        """
+        try:
+            con = sqlite3.connect(self.db_path)
+            cur = con.cursor()
+            # meta (JSON) es opcional; si no existe la columna, caemos al SELECT sin meta
             try:
-                hits = await self.search.search(q, count=10)
+                cur.execute("""
+                    SELECT e.chunk_id, e.dim, e.vec, c.text, c.meta
+                    FROM embeddings e
+                    JOIN chunks c ON c.id = e.chunk_id
+                """)
+                rows = cur.fetchall()
+            except sqlite3.OperationalError:
+                cur.execute("""
+                    SELECT e.chunk_id, e.dim, e.vec, c.text
+                    FROM embeddings e
+                    JOIN chunks c ON c.id = e.chunk_id
+                """)
+                rows = [(cid, dim, vec, txt, None) for (cid, dim, vec, txt) in cur.fetchall()]
+        except sqlite3.Error:
+            return [], [], None, []
+        finally:
+            try:
+                con.close()
             except Exception:
-                hits = []
-            web_docs: List[dict] = []
-            for it in hits:
-                url = it.get("url"); name = it.get("name", "") or ""
-                if not url:
-                    continue
-                txt, from_cache = await cached_fetch_and_clean(
-                    url, db_path=self.cache_db, ttl_hours=24 * 7, return_flag=True
-                )
-                if from_cache:
-                    notes["cache_hits"] = int(notes["cache_hits"]) + 1
-                if txt:
-                    web_docs.append({"title": name, "url": url, "text": txt})
-            if web_docs:
-                docs.extend(web_docs)
-                notes["web_added"] = int(notes["web_added"]) + len(web_docs)
+                pass
 
-        # Render final con todo lo disponible
-        md, cits = build_structured_markdown(q, docs, self.preferred_domains)
-        notes["citations"] = cits
-        return notes, md
+        ids, texts, vecs, metas = [], [], [], []
+        for cid, dim, blob, txt, meta_raw in rows:
+            if blob is None:
+                continue
+            v = np.frombuffer(blob, dtype=np.float32)
+            if v.shape[0] != int(dim or 0):
+                continue
+            ids.append(str(cid))
+            texts.append(txt or "")
+            vecs.append(v)
+            meta = {}
+            if meta_raw:
+                try:
+                    meta = json.loads(meta_raw)
+                except Exception:
+                    meta = {}
+            metas.append(meta)
+        if not vecs:
+            return [], [], None, []
+        return ids, texts, np.stack(vecs, axis=0), metas
+
+    def _source_from_meta(self, cid: str, meta: dict) -> str:
+        # Elige la mejor “firma” de fuente disponible
+        for k in ("url", "source", "path"):
+            val = (meta or {}).get(k)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        # Títulos útiles
+        title = (meta or {}).get("title") or (meta or {}).get("book_title")
+        if title:
+            return f"local:{title}"
+        return f"local:chunk:{cid}"
+
+    def _top_by_embedding(self, query: str, topn: int = 40) -> List[Hit]:
+        ids, texts, vecs, metas = self._load_all_embeddings()
+        if vecs is None or not ids:
+            return []
+        qv = self.emb.embed([query])[0]  # (D,)
+        sims = cosine_sim(vecs, qv[None, :]).ravel()
+        order = np.argsort(-sims)[:topn]
+        out: List[Hit] = []
+        for i in order:
+            cid = ids[i]
+            src = self._source_from_meta(cid, metas[i] if i < len(metas) else {})
+            out.append(Hit(chunk_id=cid, text=texts[i], source=src))
+        return out
+
+    # ------------------- Pipeline principal -------------------
+    async def run(self, q: str):
+        q = (q or "").strip()
+        if not q:
+            return {"error": "empty_query"}, "⚠️ Pregunta vacía."
+
+        # 1) recuperar candidatos por embedding
+        hits = self._top_by_embedding(q, topn=60)
+        if not hits:
+            # Sin base local: evita alucinaciones. Pide refinar datos.
+            answer = (
+                "No encuentro contenido local aún indexado para responder con confianza. "
+                "Carga PDFs en la base o habilita búsqueda web, y vuelve a intentar."
+            )
+            notes = {"sections": [], "citations": [], "used_sentences": 0}
+            return notes, answer
+
+        # 2) partir en oraciones, clasificar, marcar negaciones
+        sents: List[str] = []
+        parents: List[Hit] = []
+        for h in hits:
+            for s in _split_sentences(h.text):
+                sents.append(s)
+                parents.append(h)
+
+        if not sents:
+            notes = {"sections": [], "citations": list({h.source for h in hits if h.source}), "used_sentences": 0}
+            return notes, "No pude extraer oraciones útiles de los documentos locales."
+
+        labels = self.cls.predict(sents)
+        sent_hits: List[Hit] = []
+        for s, ph, lab in zip(sents, parents, labels):
+            sent_hits.append(
+                Hit(
+                    chunk_id=ph.chunk_id,
+                    text=s,
+                    source=ph.source,
+                    section=_canon_label(lab),
+                    negated=is_negated(s),
+                )
+            )
+
+        # 3) rerank con tu Ranker (MMR + boosts por dominio preferido / recencia si lo aplicas ahí)
+        top = self.rank.rerank(q, sent_hits, k=18)
+
+        # 4) agrupar y preparar evidencia ordenada por sección
+        by_sec: Dict[str, List[str]] = {}
+        for h in top:
+            sec = h.section or "Otros"
+            # (opcional) Si no quieres oraciones negadas en “Síntomas”, podrías filtrarlas:
+            # if sec == "Síntomas" and h.negated: continue
+            by_sec.setdefault(sec, []).append(h.text)
+
+        # Recorta por sección para el prompt
+        def _bulletize(lines: List[str], n: int) -> List[str]:
+            out, seen = [], set()
+            for t in lines:
+                key = re.sub(r"[^a-z0-9áéíóúüñ ]", "", t.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(f"- {t.strip().rstrip('.')}.")
+                if len(out) >= n:
+                    break
+            return out
+
+        evidence_md = []
+        for sec, lines in by_sec.items():
+            bullets = _bulletize(lines, 6)
+            if not bullets:
+                continue
+            evidence_md.append(f"### {sec}\n" + "\n".join(bullets))
+
+        # 5) Prompt para LLM (controlado y en español)
+        system = (
+            "Eres un asistente clínico. Responde SOLO con la evidencia proporcionada. "
+            "Evita contradicciones; si hay conflicto, explica la incertidumbre. "
+            "Responde en español y organiza en secciones con títulos claros: "
+            "Motivo / Contexto, Síntomas, Examen, Diagnóstico, Plan. "
+            "Sé conciso y clínicamente útil."
+        )
+        user = f"Pregunta: {q}\n\nEVIDENCIA LOCAL (resumen por secciones):\n\n" + "\n\n".join(evidence_md)
+
+        answer = await self.llm.complete(system, user)
+
+        notes = {
+            "sections": [sec for sec, lines in by_sec.items() if lines],
+            "citations": sorted(list({h.source for h in top if h.source})),
+            "used_sentences": sum(len(v) for v in by_sec.values()),
+            "generated_at": time.time(),
+        }
+        return notes, answer

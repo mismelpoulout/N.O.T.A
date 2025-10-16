@@ -1,0 +1,1 @@
+modelo Ollama instalado en el backend

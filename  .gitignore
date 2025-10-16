@@ -1,0 +1,64 @@
+# =======================================
+# 🧠 N.O.T.A Backend — Git Ignore
+# =======================================
+
+# --- Entornos virtuales ---
+.venv/
+venv/
+env/
+.venv312/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*$py.class
+
+# --- Configuración local y secretos ---
+# ⚠️ No subir nunca variables de entorno ni claves
+backend/.env
+.env
+*.env
+
+# --- Archivos temporales / logs ---
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Compilados / caches ---
+.cache/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
+.ipynb_checkpoints/
+*.sqlite*
+*.db-shm
+*.db-wal
+
+# --- Datos locales o de prueba ---
+backend/data/*
+!backend/data/.gitkeep          # mantiene el folder vacío
+*.jsonl
+*.json.tmp
+
+# --- VSCode / IDE ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- MacOS ---
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# --- Deploy ---
+# Archivos generados por Render u otros servicios
+*.tar.gz
+*.zip
+*.egg-info/
+dist/
+build/

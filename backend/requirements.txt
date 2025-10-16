@@ -1,0 +1,30 @@
+# --- API ---
+fastapi==0.111.0
+uvicorn==0.30.1
+python-dotenv==1.0.1
+
+# --- storage / async ---
+aiosqlite==0.21.0
+
+# --- scraping opcional ---
+beautifulsoup4==4.12.3
+trafilatura==1.12.1
+lxml_html_clean==0.4.3
+
+# --- numérico / embeddings ---
+numpy==1.26.4
+fastembed==0.4.1
+scikit-learn==1.5.2
+
+# --- PDF (elige auto fallback) ---
+PyMuPDF==1.24.10; python_version < "3.13"
+pypdf==4.3.1
+
+tqdm==4.66.5
+
+# --- LLM OpenAI-compatible (Ollama) ---
+openai==1.51.0
+
+# --- perf opcional ---
+orjson==3.10.7 ; platform_system != "Windows"
+uvloop==0.20.0 ; platform_system == "Linux"

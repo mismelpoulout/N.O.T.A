@@ -2,7 +2,7 @@ services:
   - type: web
     name: nota-backend
     env: python
-    pythonVersion: 3.12.6          # 🔥 Fuerza la versión de Python real
+    pythonVersion: 3.12.6        # Fuerza Python 3.12 en Render
     plan: free
     branch: main
     autoDeploy: true
@@ -12,6 +12,7 @@ services:
       python -m pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r requirements.txt
       mkdir -p backend/data
+      # Descargas opcionales de bases SQLite legacy (si pones las URLs en el dashboard)
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
         echo "Descargando medical_fts.sqlite..."
         curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || true
@@ -28,40 +29,53 @@ services:
       --timeout-keep-alive 65
 
     envVars:
+      # ====== Entorno de la app ======
       - key: ENV
         value: production
       - key: ENABLE_DOCS
         value: "false"
-
-      # CORS
       - key: ALLOWED_ORIGINS
         value: "*"
-
-      # Hosts seguros
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
 
-      # Rutas internas de datos
+      # ====== Rutas de datos ======
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
+
+      # Nuevo pipeline RAG (SQLite con embeddings)
+      - key: SQLITE_DB
+        value: /opt/render/project/src/backend/data/medical.db
+      # TTL de caché (segundos) — opcional
+      - key: CACHE_TTL_SECONDS
+        value: "86400"
+
+      # ====== Legacy (solo si sigues usando el pipeline anterior) ======
       - key: IOS_FTS_DB
         value: /opt/render/project/src/backend/data/medical_fts.sqlite
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
-
-      # Motor de búsqueda
       - key: SEARCH_ENGINE
         value: GOOGLE
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # Bases SQLite opcionales
+      # ====== Descarga opcional de las SQLite (pon las URLs en el Dashboard) ======
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
-      # Claves API (ponlas en el Dashboard)
+      # ====== LLM open-source vía cliente HTTP (si tu pipeline RAG los usa) ======
+      # Ejemplo para un servidor como Ollama/OpenWebUI/Llama.cpp/LM Studio
+      - key: LLM_BASE_URL
+        value: https://tu-llm-host:port         # cambia o eliminalo si no aplica
+      - key: LLM_MODEL
+        value: llama3.1:8b-instruct             # ejemplo; ajusta al que tengas
+      - key: LLM_API_KEY
+        sync: false                             # si tu server requiere clave, defínela en el dashboard
+
+      # ====== Claves externas (legacy search) — define los valores en el dashboard ======
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -72,5 +86,7 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
+
+      # ====== API Key opcional del servidor para proteger /chat ======
       - key: SERVER_API_KEY
         sync: false
