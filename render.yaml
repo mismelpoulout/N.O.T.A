@@ -2,7 +2,6 @@ services:
   - type: web
     name: nota-backend
     runtime: python
-    pythonVersion: 3.12.6
     plan: free
     branch: main
     autoDeploy: true
@@ -13,12 +12,10 @@ services:
       pip install --no-cache-dir -r requirements.txt
       mkdir -p backend/data
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
-        echo "Descargando medical_fts.sqlite..."
-        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || echo "No se pudo descargar medical_fts.sqlite"
+        curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || true
       fi
       if [ -n "$GCS_OUTPUT_DB_URL" ]; then
-        echo "Descargando output.db..."
-        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || echo "No se pudo descargar output.db"
+        curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || true
       fi
 
     startCommand: >
@@ -30,10 +27,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
+
       - key: ENV
         value: production
       - key: ENABLE_DOCS
         value: "false"
+
       - key: ALLOWED_ORIGINS
         value: "*"
       - key: TRUSTED_HOSTS
@@ -66,5 +65,6 @@ services:
         value: https://api.bing.microsoft.com/v7.0/search
       - key: BING_MKT
         value: es-CL
+
       - key: SERVER_API_KEY
         sync: false
