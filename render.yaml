@@ -1,18 +1,20 @@
 services:
   - type: web
     name: nota-backend
-    env: python
-    pythonVersion: 3.12.6        # Fuerza Python 3.12 en Render
+    runtime: python
     plan: free
     branch: main
     autoDeploy: true
     healthCheckPath: /health
 
+    # Fuerza Python 3.12.6 en Render
+    pythonVersion: 3.12.6
+
     buildCommand: |
       python -m pip install --upgrade pip setuptools wheel
       pip install --no-cache-dir -r requirements.txt
+      chmod +x start.sh
       mkdir -p backend/data
-      # Descargas opcionales de bases SQLite legacy (si pones las URLs en el dashboard)
       if [ -n "$GCS_MEDICAL_FTS_URL" ]; then
         echo "Descargando medical_fts.sqlite..."
         curl -fsSL "$GCS_MEDICAL_FTS_URL" -o backend/data/medical_fts.sqlite || true
@@ -22,14 +24,11 @@ services:
         curl -fsSL "$GCS_OUTPUT_DB_URL" -o backend/data/output.db || true
       fi
 
-    startCommand: >
-      uvicorn backend.app:app
-      --host 0.0.0.0 --port $PORT
-      --proxy-headers --forwarded-allow-ips="*"
-      --timeout-keep-alive 65
+    # Usamos tu script start.sh
+    startCommand: ./start.sh
 
     envVars:
-      # ====== Entorno de la app ======
+      # Entorno app
       - key: ENV
         value: production
       - key: ENABLE_DOCS
@@ -38,44 +37,32 @@ services:
         value: "*"
       - key: TRUSTED_HOSTS
         value: "*.onrender.com,localhost,127.0.0.1"
+      - key: FORCE_HTTPS
+        value: "false"
 
-      # ====== Rutas de datos ======
+      # Rutas internas de datos (efímeras)
       - key: DATA_DIR
         value: /opt/render/project/src/backend/data
-
-      # Nuevo pipeline RAG (SQLite con embeddings)
       - key: SQLITE_DB
         value: /opt/render/project/src/backend/data/medical.db
-      # TTL de caché (segundos) — opcional
-      - key: CACHE_TTL_SECONDS
-        value: "86400"
-
-      # ====== Legacy (solo si sigues usando el pipeline anterior) ======
       - key: IOS_FTS_DB
         value: /opt/render/project/src/backend/data/medical_fts.sqlite
       - key: OUTPUT_DB
         value: /opt/render/project/src/backend/data/output.db
-      - key: SEARCH_ENGINE
-        value: GOOGLE
+
+      # Preferencias de ranking
       - key: PREFERRED_DOMAINS
         value: "minsal.cl,intramed.net,medlineplus.gov,mayoclinic.org"
 
-      # ====== Descarga opcional de las SQLite (pon las URLs en el Dashboard) ======
+      # Descarga opcional de bases (configúralas en el Dashboard)
       - key: GCS_MEDICAL_FTS_URL
         sync: false
       - key: GCS_OUTPUT_DB_URL
         sync: false
 
-      # ====== LLM open-source vía cliente HTTP (si tu pipeline RAG los usa) ======
-      # Ejemplo para un servidor como Ollama/OpenWebUI/Llama.cpp/LM Studio
-      - key: LLM_BASE_URL
-        value: https://tu-llm-host:port         # cambia o eliminalo si no aplica
-      - key: LLM_MODEL
-        value: llama3.1:8b-instruct             # ejemplo; ajusta al que tengas
-      - key: LLM_API_KEY
-        sync: false                             # si tu server requiere clave, defínela en el dashboard
-
-      # ====== Claves externas (legacy search) — define los valores en el dashboard ======
+      # Buscador (si usas legacy search client)
+      - key: SEARCH_ENGINE
+        value: GOOGLE
       - key: GOOGLE_API_KEY
         sync: false
       - key: GOOGLE_CX
@@ -87,6 +74,14 @@ services:
       - key: BING_MKT
         value: es-CL
 
-      # ====== API Key opcional del servidor para proteger /chat ======
+      # LLM (si apuntas a un endpoint público/externo)
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_MODEL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+
+      # (Opcional) proteger /chat
       - key: SERVER_API_KEY
         sync: false
